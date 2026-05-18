@@ -24,6 +24,8 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/mendersoftware/mender-cli/log"
+
 	"github.com/google/uuid"
 	"github.com/mendersoftware/go-lib-micro/ws"
 	"github.com/mendersoftware/go-lib-micro/ws/portforward"
@@ -38,6 +40,7 @@ type TCPPortForwarder struct {
 	remoteHost string
 	remotePort uint16
 	mutexAck   map[string]*sync.Mutex
+	proto      ws.ProtoType
 }
 
 func NewTCPPortForwarder(
@@ -45,6 +48,7 @@ func NewTCPPortForwarder(
 	localPort uint16,
 	remoteHost string,
 	remotePort uint16,
+	proto ws.ProtoType,
 ) (*TCPPortForwarder, error) {
 	fmt.Printf("Forwarding from %s:%d -> %s:%d\n", bindingHost, localPort, remoteHost, remotePort)
 	listen, err := net.Listen(protocolTCP, bindingHost+":"+strconv.Itoa(int(localPort)))
@@ -56,6 +60,7 @@ func NewTCPPortForwarder(
 		remoteHost: remoteHost,
 		remotePort: remotePort,
 		mutexAck:   map[string]*sync.Mutex{},
+		proto:      proto,
 	}, nil
 }
 
@@ -100,6 +105,70 @@ func (p *TCPPortForwarder) Run(
 	}
 }
 
+// go routine to handle received messages
+func (p *TCPPortForwarder) handleDeviceMessages(
+	ctx context.Context,
+	msgChan chan<- *ws.ProtoMsg,
+	dataChan chan<- []byte,
+	recvChan <-chan *ws.ProtoMsg,
+	errChan chan<- error,
+	conn net.Conn,
+	sessionID, connectionID string,
+) {
+	started := false
+	for {
+		select {
+		case m := <-recvChan:
+			switch m.Header.MsgType {
+			case wspf.MessageTypePortForwardNew:
+				if started {
+					log.Err("duplicate new response received, discarding")
+					continue
+				}
+				// go routine to handle the network connection
+				go p.handleRequestConnection(dataChan, errChan, conn)
+				started = true
+
+			case wspf.MessageTypePortForwardStop,
+				wspf.MessageTypePortForward:
+				_, err := conn.Write(m.Body)
+				if err != nil {
+					if errors.Unwrap(err) != net.ErrClosed {
+						fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
+					}
+				} else if p.proto == ws.ProtoTypePortForward {
+					// send the ack
+					m := &ws.ProtoMsg{
+						Header: ws.ProtoHdr{
+							Proto:     ws.ProtoTypePortForward,
+							MsgType:   wspf.MessageTypePortForwardAck,
+							SessionID: sessionID,
+							Properties: map[string]interface{}{
+								wspf.PropertyConnectionID: connectionID,
+							},
+						},
+					}
+					msgChan <- m
+				}
+
+			case wspf.MessageTypePortForwardAck:
+				if p.proto == ws.ProtoTypePortForward {
+					if m, ok := p.mutexAck[connectionID]; ok {
+						m.Unlock()
+					}
+					break
+				}
+				fallthrough
+			default:
+				fmt.Fprintf(os.Stderr, "error: unrecognized message type %s\n",
+					m.Header.MsgType)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func (p *TCPPortForwarder) handleRequest(
 	ctx context.Context,
 	conn net.Conn,
@@ -131,7 +200,7 @@ func (p *TCPPortForwarder) handleRequest(
 	}
 	m := &ws.ProtoMsg{
 		Header: ws.ProtoHdr{
-			Proto:     ws.ProtoTypePortForward,
+			Proto:     p.proto,
 			MsgType:   wspf.MessageTypePortForwardNew,
 			SessionID: sessionID,
 			Properties: map[string]interface{}{
@@ -148,7 +217,7 @@ func (p *TCPPortForwarder) handleRequest(
 		if sendStopMessage {
 			m := &ws.ProtoMsg{
 				Header: ws.ProtoHdr{
-					Proto:     ws.ProtoTypePortForward,
+					Proto:     p.proto,
 					MsgType:   wspf.MessageTypePortForwardStop,
 					SessionID: sessionID,
 					Properties: map[string]interface{}{
@@ -160,50 +229,11 @@ func (p *TCPPortForwarder) handleRequest(
 		}
 	}()
 
-	// go routine to handle the network connection
-	go p.handleRequestConnection(dataChan, errChan, conn)
-
-	// go routine to handle received messages
-	go func(connectionID string) {
-		for {
-			select {
-			case m := <-recvChan:
-				if m.Header.Proto == ws.ProtoTypePortForward &&
-					m.Header.MsgType == wspf.MessageTypePortForwardStop {
-					sendStopMessage = false
-					return
-				} else if m.Header.Proto == ws.ProtoTypePortForward &&
-					m.Header.MsgType == wspf.MessageTypePortForward {
-					_, err := conn.Write(m.Body)
-					if err != nil {
-						if errors.Unwrap(err) != net.ErrClosed {
-							fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
-						}
-					} else {
-						// send the ack
-						m := &ws.ProtoMsg{
-							Header: ws.ProtoHdr{
-								Proto:     ws.ProtoTypePortForward,
-								MsgType:   wspf.MessageTypePortForwardAck,
-								SessionID: sessionID,
-								Properties: map[string]interface{}{
-									wspf.PropertyConnectionID: connectionID,
-								},
-							},
-						}
-						msgChan <- m
-					}
-				} else if m.Header.Proto == ws.ProtoTypePortForward &&
-					m.Header.MsgType == wspf.MessageTypePortForwardAck {
-					if m, ok := p.mutexAck[connectionID]; ok {
-						m.Unlock()
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}(connectionID)
+	go p.handleDeviceMessages(
+		ctx, msgChan, dataChan,
+		recvChan, errChan, conn,
+		sessionID, connectionID,
+	)
 
 	// go routine to handle sent messages
 	for {
@@ -214,12 +244,14 @@ func (p *TCPPortForwarder) handleRequest(
 			}
 			return
 		case data := <-dataChan:
-			// lock the ack mutex, we don't allow more than one in-flight message
-			p.mutexAck[connectionID].Lock()
+			if p.proto == ws.ProtoTypePortForward {
+				// lock the ack mutex, we don't allow more than one in-flight message
+				p.mutexAck[connectionID].Lock()
+			}
 
 			m := &ws.ProtoMsg{
 				Header: ws.ProtoHdr{
-					Proto:     ws.ProtoTypePortForward,
+					Proto:     p.proto,
 					MsgType:   wspf.MessageTypePortForward,
 					SessionID: sessionID,
 					Properties: map[string]interface{}{
@@ -236,8 +268,8 @@ func (p *TCPPortForwarder) handleRequest(
 }
 
 func (p *TCPPortForwarder) handleRequestConnection(
-	dataChan chan []byte,
-	errChan chan error,
+	dataChan chan<- []byte,
+	errChan chan<- error,
 	conn net.Conn,
 ) {
 	data := make([]byte, readBuffLength)
