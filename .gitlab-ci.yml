@@ -200,6 +200,7 @@ test:integration:
   variables:
     GIT_SUBMODULE_STRATEGY: recursive
     GIT_SUBMODULE_DEPTH: 1
+    CLIENT_VERSION: "latest"
   image: docker:${DOCKER_VERSION}
   needs:
     - compile
