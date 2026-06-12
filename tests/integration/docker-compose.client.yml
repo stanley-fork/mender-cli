@@ -3,7 +3,7 @@ services:
   # mender-client
   #
   client:
-    image: mendersoftware/mender-client-qemu:${CLIENT_VERSION}
+    image: mendersoftware/mender-client-qemu:${CLIENT_VERSION:-latest}
     stdin_open: true
     tty: true
     privileged: true
